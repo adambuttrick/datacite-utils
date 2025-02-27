@@ -16,7 +16,7 @@ from multiprocessing import Pool, cpu_count, Manager
 
 
 class LoggerSetup:
-    LOGGER_NAME = 'datacite_datafile_processor'
+    LOGGER_NAME = 'datacite_datafile_parser'
 
     @classmethod
     def configure(cls, level_name):
@@ -40,6 +40,9 @@ class ArgumentConfig:
         self.all = False
         self.providers = []
         self.clients = []
+        self.sort_rtg_only = False
+        self.sort_provider_client_rtg = False
+        self.processes = None
 
     @classmethod
     def parse_arguments(cls):
@@ -47,14 +50,16 @@ class ArgumentConfig:
             description='Process DataCite metadata files into hierarchical directory structure'
         )
 
-        parser.add_argument('--input-dir', '-i', required=True,
-                            help='Directory containing DataCite data files (.jsonl.gz or .json.lz).')
-        parser.add_argument('--output-dir', '-o', required=True,
+        parser.add_argument('-i', '--input-dir', required=True,
+                            help='Directory containing DataCite data files.')
+        parser.add_argument('-o', '--output-dir', required=True,
                             help='Output directory for data.')
-        parser.add_argument('--cache-dir', '-c',
+        parser.add_argument('-c', '--cache-dir',
                             help='Directory for caching API responses (optional).')
-        parser.add_argument('--log-level', '-l', default='INFO',
+        parser.add_argument('-l', '--log-level', default='INFO',
                             help='Logging level (INFO, DEBUG, etc.).')
+        parser.add_argument('-n', '--processes', type=int, default=None,
+                            help='Number of processes to use (default: number of CPU cores - 1).')
 
         mode_group = parser.add_mutually_exclusive_group(required=True)
         mode_group.add_argument('-a', '--all', action='store_true',
@@ -63,6 +68,12 @@ class ArgumentConfig:
                                 help='Process only records for the given provider ID(s).')
         mode_group.add_argument('-r', '--clients', nargs='+',
                                 help='Process only records for the given repositories/client ID(s).')
+
+        sort_group = parser.add_mutually_exclusive_group(required=False)
+        sort_group.add_argument('-rtgo', '--sort-rtg-only', action='store_true',
+                                help='Process exclusively by resourceTypeGeneral (ignore providers/clients).')
+        sort_group.add_argument('-rtgpc', '--sort-provider-client-and-rtg', action='store_true',
+                                help='Process by provider/client, and within each client, sub-sort by resourceTypeGeneral.')
 
         args = parser.parse_args()
 
@@ -77,6 +88,13 @@ class ArgumentConfig:
             config.providers = args.providers
         if args.clients:
             config.clients = args.clients
+
+        if args.sort_rtg_only:
+            config.sort_rtg_only = True
+        if args.sort_provider_client_and_rtg:
+            config.sort_provider_client_rtg = True
+
+        config.processes = args.processes
 
         return config
 
@@ -143,19 +161,34 @@ class DirectoryManager:
             self.logger.error(f"Error writing client data for {client_id}: {str(e)}")
             return False
 
-    def _stable_subdir_name(self, provider_id, client_id):
-        key = f"{provider_id}:{client_id}"
-        md5_hex = hashlib.md5(key.encode('utf-8')).hexdigest()
+    def get_rtg_directory(self, resource_type_general):
+        rtg_base = self.output_dir / "resourceTypeGeneral"
+        self._mkdir_once(rtg_base)
+        rtg_dir = rtg_base / resource_type_general
+        self._mkdir_once(rtg_dir)
+        return rtg_dir
+
+    def _stable_subdir_name(self, *args):
+        """
+        Return a stable sub-directory name (2 hex digits) from the MD5 of all joined arguments.
+        """
+        key_str = "__".join(str(a) for a in args)
+        md5_hex = hashlib.md5(key_str.encode('utf-8')).hexdigest()
         return md5_hex[:2]
 
-    def get_hashed_records_file(self, provider_id, client_id):
+    def get_hashed_records_file(self, *key_parts):
+        """
+        Creates a hashed sub-directory name for the joined key, then returns the file path:
+          hashed_records/<2-hex>/<key>.jsonl
+        Where <key> is joined by "__".
+        """
         hashed_records_dir = self.output_dir / "hashed_records"
-        hashed_subdir_name = self._stable_subdir_name(provider_id, client_id)
+        hashed_subdir_name = self._stable_subdir_name(*key_parts)
         hashed_subdir = hashed_records_dir / hashed_subdir_name
         self._mkdir_once(hashed_subdir)
 
-        file_name = f"{provider_id}_{client_id}.jsonl"
-        return hashed_subdir / file_name
+        filename = "__".join(str(k) for k in key_parts) + ".jsonl"
+        return hashed_subdir / filename
 
 
 class FileWriter:
@@ -166,10 +199,8 @@ class FileWriter:
         self.record_buffers = defaultdict(list)
         self.buffer_count = 0
 
-    def add_to_batch(self, provider_id, client_id, record):
-        if not provider_id or not client_id:
-            return
-        self.record_buffers[(provider_id, client_id)].append(record)
+    def add_to_batch(self, key, record):
+        self.record_buffers[key].append(record)
         self.buffer_count += 1
 
         if self.buffer_count >= self.batch_size:
@@ -179,8 +210,8 @@ class FileWriter:
         if not self.record_buffers:
             return
 
-        for (provider_id, client_id), records in self.record_buffers.items():
-            filepath = self.directory_manager.get_hashed_records_file(provider_id, client_id)
+        for key, records in self.record_buffers.items():
+            filepath = self.directory_manager.get_hashed_records_file(*key)
             try:
                 with open(filepath, 'ab', buffering=2**20) as f:
                     for rec in records:
@@ -423,8 +454,7 @@ class FileProcessor:
         else:
             self.logger.info(message)
 
-    def _in_scope(self, provider_id, client_id):
-        """Filter by user mode."""
+    def _in_scope_providers_clients(self, provider_id, client_id):
         if self.config.all:
             return True
         elif self.config.providers:
@@ -440,22 +470,37 @@ class FileProcessor:
             reader = BatchGzipReader(filepath)
 
             for item in reader:
+                # Always skip if state != 'findable'
                 if item.get('attributes', {}).get('state') != 'findable':
                     skipped_count += 1
                     continue
 
+                attributes = item.get('attributes', {})
                 relationships = item.get('relationships', {})
                 client_id = relationships.get('client', {}).get('data', {}).get('id')
                 provider_id = relationships.get('provider', {}).get('data', {}).get('id')
-                if not client_id or not provider_id:
-                    skipped_count += 1
-                    continue
 
-                if not self._in_scope(provider_id, client_id):
-                    skipped_count += 1
-                    continue
+                rtg = None
+                types_info = attributes.get('types', {})
+                if isinstance(types_info, dict):
+                    rtg = types_info.get('resourceTypeGeneral')
+                if not rtg:
+                    rtg = "Unknown"
 
-                self.file_writer.add_to_batch(provider_id, client_id, item)
+                if self.config.sort_rtg_only:
+                    key = (rtg,)
+                elif self.config.sort_provider_client_rtg:
+                    if not self._in_scope_providers_clients(provider_id, client_id):
+                        skipped_count += 1
+                        continue
+                    key = (provider_id, client_id, rtg)
+                else:
+                    if not self._in_scope_providers_clients(provider_id, client_id):
+                        skipped_count += 1
+                        continue
+                    key = (provider_id, client_id)
+
+                self.file_writer.add_to_batch(key, item)
                 processed_count += 1
 
             self.file_writer.flush_batch()
@@ -517,21 +562,37 @@ class RecordReorganizer:
 
             for hashed_file in subdir.glob("*.jsonl"):
                 filename = hashed_file.name
-                if "_" not in filename:
-                    continue
-
                 stem = hashed_file.stem
-                parts = stem.split("_", 1)
-                if len(parts) != 2:
-                    continue
+                parts = stem.split("__")
+                final_path = None
 
-                provider_id, client_id = parts
-                client_dir = self.directory_manager.get_client_directory(provider_id, client_id)
-                records_dir = client_dir / "records"
-                self.directory_manager._mkdir_once(records_dir)
+                if len(parts) == 1:
+                    # rtg-only
+                    resource_type_general = parts[0]
+                    rtg_dir = self.directory_manager.get_rtg_directory(resource_type_general)
+                    final_path = rtg_dir / "records.jsonl.gz" if compress else rtg_dir / "records.jsonl"
+
+                elif len(parts) == 2:
+                    # provider_id / client_id
+                    provider_id, client_id = parts
+                    client_dir = self.directory_manager.get_client_directory(provider_id, client_id)
+                    records_dir = client_dir / "records"
+                    self.directory_manager._mkdir_once(records_dir)
+                    final_path = records_dir / ("records.jsonl.gz" if compress else "records.jsonl")
+
+                elif len(parts) == 3:
+                    # provider_id, client_id, resourceTypeGeneral
+                    provider_id, client_id, resource_type_general = parts
+                    client_dir = self.directory_manager.get_client_directory(provider_id, client_id)
+                    rtg_dir = client_dir / resource_type_general
+                    self.directory_manager._mkdir_once(rtg_dir)
+                    final_path = rtg_dir / ("records.jsonl.gz" if compress else "records.jsonl")
+
+                else:
+                    self.logger.warning(f"Unexpected hashed file format: {hashed_file}")
+                    continue
 
                 if compress:
-                    final_path = records_dir / "records.jsonl.gz"
                     try:
                         with open(hashed_file, 'rb') as infile, gzip.open(final_path, 'wb') as outfile:
                             shutil.copyfileobj(infile, outfile)
@@ -539,7 +600,6 @@ class RecordReorganizer:
                     except Exception as e:
                         self.logger.error(f"Error compressing {hashed_file} -> {final_path}: {str(e)}")
                 else:
-                    final_path = records_dir / "records.jsonl"
                     try:
                         hashed_file.rename(final_path)
                     except Exception as e:
@@ -572,62 +632,71 @@ class DataCiteDataFileProcessor:
                 self.logger.error("Failed to create base output directory.")
                 return 1
 
-            api_client = DataCiteAPIClient(cache_dir=config.cache_dir)
+            # If doing rtg-only, skip all provider/client lookups
+            # because we do not filter or store provider/client metadata
+            # in that scenario
+            fetch_providers_and_clients = not config.sort_rtg_only
 
-            if config.all:
-                self.logger.info("Fetching ALL providers and clients...")
-                providers_data = api_client.get_providers()
-                clients_data = api_client.get_clients()
+            if fetch_providers_and_clients:
+                api_client = DataCiteAPIClient(cache_dir=config.cache_dir)
 
-            elif config.providers:
-                self.logger.info(f"Fetching only for providers {config.providers}")
-                providers_data = api_client.get_providers_by_ids(config.providers)
-                provider_ids_we_have = {p['id'] for p in providers_data if p is not None}
+                if config.all:
+                    self.logger.info("Fetching ALL providers and clients...")
+                    providers_data = api_client.get_providers()
+                    clients_data = api_client.get_clients()
 
-                clients_data = []
-                for pid in provider_ids_we_have:
-                    pclients = api_client.get_clients_for_provider(pid)
-                    clients_data.extend(pclients)
+                elif config.providers:
+                    self.logger.info(f"Fetching only for providers {config.providers}")
+                    providers_data = api_client.get_providers_by_ids(config.providers)
+                    provider_ids_we_have = {p['id'] for p in providers_data if p is not None}
 
-            else:
-                self.logger.info(f"Fetching only for clients {config.clients}")
-                clients_data = api_client.get_clients_by_ids(config.clients)
+                    clients_data = []
+                    for pid in provider_ids_we_have:
+                        pclients = api_client.get_clients_for_provider(pid)
+                        clients_data.extend(pclients)
 
-                provider_ids = set()
+                elif config.clients:
+                    self.logger.info(f"Fetching only for clients {config.clients}")
+                    clients_data = api_client.get_clients_by_ids(config.clients)
+
+                    provider_ids = set()
+                    for c in clients_data:
+                        prov_id = c.get('relationships', {}).get('provider', {}).get('data', {}).get('id')
+                        if prov_id:
+                            provider_ids.add(prov_id)
+
+                    providers_data = api_client.get_providers_by_ids(provider_ids)
+                else:
+                    providers_data = []
+                    clients_data = []
+
+                provider_map = {}
+                for p in providers_data:
+                    if not p:
+                        continue
+                    pid = p.get('id')
+                    provider_map[pid] = p.get('attributes', {})
+
+                client_map = {}
                 for c in clients_data:
-                    prov_id = c.get('relationships', {}).get('provider', {}).get('data', {}).get('id')
-                    if prov_id:
-                        provider_ids.add(prov_id)
+                    if not c:
+                        continue
+                    cid = c.get('id')
+                    provider_id = c.get('relationships', {}).get('provider', {}).get('data', {}).get('id')
+                    client_map[cid] = {
+                        'provider_id': provider_id,
+                        'attributes': c.get('attributes', {})
+                    }
 
-                providers_data = api_client.get_providers_by_ids(provider_ids)
+                self.logger.info("Writing provider metadata...")
+                for pid, attr in provider_map.items():
+                    directory_manager.write_provider_data(pid, attr)
 
-            provider_map = {}
-            for p in providers_data:
-                if not p:
-                    continue
-                pid = p.get('id')
-                provider_map[pid] = p.get('attributes', {})
-
-            client_map = {}
-            for c in clients_data:
-                if not c:
-                    continue
-                cid = c.get('id')
-                provider_id = c.get('relationships', {}).get('provider', {}).get('data', {}).get('id')
-                client_map[cid] = {
-                    'provider_id': provider_id,
-                    'attributes': c.get('attributes', {})
-                }
-
-            self.logger.info("Writing provider metadata...")
-            for pid, attr in provider_map.items():
-                directory_manager.write_provider_data(pid, attr)
-
-            self.logger.info("Writing client metadata...")
-            for cid, info in client_map.items():
-                prov_id = info['provider_id']
-                if prov_id is not None:
-                    directory_manager.write_client_data(prov_id, cid, info['attributes'])
+                self.logger.info("Writing client metadata...")
+                for cid, info in client_map.items():
+                    prov_id = info['provider_id']
+                    if prov_id is not None:
+                        directory_manager.write_client_data(prov_id, cid, info['attributes'])
 
             file_scanner = FileScanner()
             files_info = file_scanner.scan_jsonl_files(config.input_dir)
@@ -645,8 +714,8 @@ class DataCiteDataFileProcessor:
             lock = manager.Lock()
 
             file_writer = FileWriter(directory_manager, batch_size=500_000)
-            processes_count = max(1, cpu_count())
-            self.logger.info(f"Using up to {processes_count} processes.")
+            processes_count = config.processes if config.processes is not None else max(1, cpu_count() - 1)
+            self.logger.info(f"Using {processes_count} processes.")
 
             pool = None
             try:
