@@ -1,6 +1,6 @@
-# DataCite Field Extractor
+# Fast Field Parser
 
-A high-performance Rust tool for extracting and analyzing field data from DataCite snapshot files.
+High-performance Rust tool for extracting and analyzing field data from DataCite snapshot files.
 
 ## Features
 
@@ -22,7 +22,7 @@ cargo install --path .
 ## Usage
 
 ```bash
-datacite-field-extractor --input <INPUT_DIR> --output <OUTPUT_FILE_OR_DIR> --fields <FIELDS> [OPTIONS]
+fast-field-parser --input <INPUT_DIR> --output <OUTPUT_FILE_OR_DIR> --fields <FIELDS> [OPTIONS]
 ```
 
 ### Options
@@ -55,27 +55,27 @@ CSV with the following columns:
 
 Basic usage to extract creator names:
 ```bash
-datacite-field-extractor -i ./data -o creator_data.csv -f creators.name
+fast-field-parser -i ./data -o creator_data.csv -f creators.name
 ```
 
 Extract multiple fields:
 ```bash
-datacite-field-extractor -i ./data -o metadata.csv -f "doi,creators.name,titles.title,subjects.subject"
+fast-field-parser -i ./data -o metadata.csv -f "doi,creators.name,titles.title,subjects.subject"
 ```
 
 Extract nested fields:
 ```bash
-datacite-field-extractor -i ./data -o affiliations.csv -f "creators.affiliation.name,contributors.affiliation.name"
+fast-field-parser -i ./data -o affiliations.csv -f "creators.affiliation.name,contributors.affiliation.name"
 ```
 
 Organize output by provider/client:
 ```bash
-datacite-field-extractor -i ./data -o ./output -g -f "doi,creators.name"
+fast-field-parser -i ./data -o ./output -g -f "doi,creators.name"
 ```
 
 Filter by provider:
 ```bash
-datacite-field-extractor -i ./data -o filtered_data.csv -f "doi,creators.name" --provider example-provider
+fast-field-parser -i ./data -o filtered_data.csv -f "doi,creators.name" --provider example-provider
 ```
 
 ## Field Path Specification
