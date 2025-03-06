@@ -128,10 +128,7 @@ class DoiSampler:
         self.logger.info(f"Processed {self.total_processed} records, found {self.total_matched} matches")
         self.logger.info(f"Final sample size: {len(self.samples)}")
         
-        if self.config.output_file:
-            self._write_output()
-        else:
-            self._print_samples()
+        self._write_output()
         
         return True
     
@@ -140,14 +137,7 @@ class DoiSampler:
             output_path = Path(self.config.output_file)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             
-            if output_path.suffix == '.gz':
-                opener = gzip.open
-                mode = 'wt'
-            else:
-                opener = open
-                mode = 'w'
-            
-            with opener(output_path, mode, newline='', encoding='utf-8') as f:
+            with open(output_path, 'w', newline='', encoding='utf-8') as f:
                 if self.samples:
                     writer = csv.DictWriter(f, fieldnames=self.samples[0].keys())
                     writer.writeheader()
@@ -160,20 +150,6 @@ class DoiSampler:
             return False
         
         return True
-    
-    def _print_samples(self):
-        if not self.samples:
-            return
-        
-        print(f"Sample of {len(self.samples)} DOIs:")
-        print("------------------------------")
-        
-        for i, sample in enumerate(self.samples, 1):
-            print(f"{i}. DOI: {sample.get('doi', 'N/A')}")
-            print(f"   State: {sample.get('state', 'N/A')}")
-            print(f"   Client: {sample.get('client_id', 'N/A')}")
-            print(f"   Updated: {sample.get('updated', 'N/A')}")
-            print("------------------------------")
 
 
 def parse_date(date_str):
@@ -194,8 +170,8 @@ def parse_arguments():
     parser.add_argument('-i', '--input-dir', required=True,
                         help='Directory containing DataCite CSV files (organized in YYYY-MM subdirectories)')
     
-    parser.add_argument('-o', '--output-file',
-                        help='Output file for sampled DOIs (CSV format, use .gz extension for compressed output)')
+    parser.add_argument('-o', '--output-file', default='doi_samples.csv',
+                        help='Output file for sampled DOIs (CSV format, default: doi_samples.csv)')
     
     parser.add_argument('-s', '--sample-size', type=int,
                         help='Number of DOIs to sample (if not specified, returns all matching DOIs)')
