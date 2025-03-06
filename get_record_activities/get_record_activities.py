@@ -42,10 +42,10 @@ class DOIRecord:
     state: str
     client_id: str
     updated: str
-    activities = field(default_factory=list)
-    normalized_doi = None
-    errors = field(default_factory=list)
-    has_changes = False
+    activities: list = field(default_factory=list)
+    normalized_doi: str = None
+    errors: list = field(default_factory=list)
+    has_changes: bool = False
 
     def __post_init__(self):
         self.normalized_doi = normalize_doi(self.doi)
