@@ -32,24 +32,27 @@ fast-field-parser --input <INPUT_DIR> --output <OUTPUT_FILE_OR_DIR> --fields <FI
 -o, --output <OUTPUT>            Output CSV file or directory [default: field_data.csv]
 -l, --log-level <LEVEL>          Logging level (DEBUG, INFO, WARN, ERROR) [default: INFO]
 -t, --threads <THREADS>          Number of threads to use (0 for auto) [default: 0]
--b, --batch-size <SIZE>          Number of records per batch [default: 10000]
--s, --stats-interval <INTERVAL>  Interval in seconds to log statistics [default: 60]
--g, --organize                   Organize output by provider/client
+-b, --batch-size <SIZE>          Number of records per batch [default: 5000]
+-g, --organize                   Organize output by provider/client using an LRU cache for file handles
     --provider <PROVIDER_ID>     Filter by provider ID
     --client <CLIENT_ID>         Filter by client ID
-    --max-open-files <MAX_FILES> Maximum open files when using --organize [default: 100]
--f, --fields <FIELDS>            Comma-separated list of fields to extract (e.g., 'creators.affiliation.name,titles') [default: creators]
+    --resource-types <TYPES>     Comma-separated list of resource types to include (e.g., 'Dataset,Text')
+    --require-all-fields         Only include records that contain all specified top-level fields
+    --field-value-filter <FILTER> Filter records where a field has a specific value (e.g., 'relatedIdentifiers.relationType=IsSupplementTo'). Can be used multiple times.
+    --field-does-not-exist <FIELD> Filter records where a field must NOT exist or be empty. Can be used multiple times.
+    --max-open-files <MAX_FILES> Maximum number of open files when using --organize [default: 100]
+-f, --fields <FIELDS>            Comma-separated list of fields to extract [default: creators.name]
 ```
 
 ## Output Format
 
 CSV with the following columns:
 - doi
+- provider_id
+- client_id
 - field_name
 - subfield_path
 - value
-- provider_id
-- client_id
 
 ## Examples
 
@@ -76,6 +79,26 @@ fast-field-parser -i ./data -o ./output -g -f "doi,creators.name"
 Filter by provider:
 ```bash
 fast-field-parser -i ./data -o filtered_data.csv -f "doi,creators.name" --provider example-provider
+```
+
+Filter by resource type:
+```bash
+fast-field-parser -i ./data -o datasets.csv -f "doi,creators.name" --resource-types Dataset,Collection
+```
+
+Filter by field value:
+```bash
+fast-field-parser -i ./data -o supplements.csv -f "doi,relatedIdentifiers.relatedIdentifier" --field-value-filter "relatedIdentifiers.relationType=IsSupplementTo"
+```
+
+Filter records missing a field:
+```bash
+fast-field-parser -i ./data -o no_funding.csv -f "doi,creators.name" --field-does-not-exist fundingReferences
+```
+
+Require all specified fields to be present:
+```bash
+fast-field-parser -i ./data -o complete_records.csv -f "doi,creators.name,titles.title" --require-all-fields
 ```
 
 ## Field Path Specification
